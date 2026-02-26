@@ -1,0 +1,684 @@
+-- Delta Executor R6 NPC [模仿系统 + 1分钟报数 + 语音交互优化版 v3.5]
+-- ✅ v3.5 彻底修复：
+--    走路动画：不删 Animate 脚本，原生处理，彻底解决卡顿重复
+--    跟随移动：去掉寻路系统，改回老脚本直接 MoveTo，平滑流畅
+--    睡觉/坐下：手动禁用/恢复 Animate 接管
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Chat = game:GetService("Chat")
+
+local player = Players.LocalPlayer
+local npc = nil
+local enabled = false
+local connections = {}
+
+-- ====================== 可自定义配置 ======================
+local NPC_USER_ID           = 5226787300
+local NPC_DISPLAY_NAME      = "SybsyLove"
+local AUTO_REPORT_INTERVAL  = 60
+local MAX_FOLLOW_DISTANCE   = 250
+local FOLLOW_START_DISTANCE = 22
+local FOLLOW_STOP_DISTANCE  = 9
+-- ==========================================================
+
+local targetPos         = nil
+local lastMoveTime      = 0
+local playerStillTime   = 0
+local hasPokedIdle      = false
+local isFollowing       = false
+local isSleeping        = false
+local isSitting         = false
+local isMimicking       = false
+
+local runStartTime        = 0
+local hasComplained       = false
+local lastCheckPeopleTime = 0
+
+local stuckTime = 0
+local jumpCount = 0
+
+local isRecreating = false
+local cachedDesc   = nil
+
+-- ============================================================
+-- 工具函数
+-- ============================================================
+
+local function safeWait(parent, name, timeout)
+    local ok, result = pcall(function()
+        return parent:WaitForChild(name, timeout or 5)
+    end)
+    if not ok or not result then
+        warn("[NPC] WaitForChild 超时: " .. tostring(name))
+        return nil
+    end
+    return result
+end
+
+local function getDesc()
+    if cachedDesc then return true, cachedDesc end
+    local ok, desc = pcall(function()
+        return Players:GetHumanoidDescriptionFromUserId(NPC_USER_ID)
+    end)
+    if ok and desc then cachedDesc = desc; return true, desc end
+    warn("[NPC] 获取外观失败")
+    return false, nil
+end
+
+local function clearConnections()
+    for _, v in pairs(connections) do
+        if v and typeof(v) == "RBXScriptConnection" and v.Connected then
+            v:Disconnect()
+        end
+    end
+    connections = {}
+end
+
+local function npcSay(text)
+    if not npc or not npc:FindFirstChild("Head") then return end
+    pcall(function() Chat:Chat(npc.Head, text, Enum.ChatColor.White) end)
+end
+
+local function makeDraggable(gui)
+    local dragging, dragInput, dragStart, startPos
+    gui.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; dragStart = input.Position; startPos = gui.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    gui.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    local globalConn = UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            gui.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+    gui.Destroying:Connect(function()
+        if globalConn and globalConn.Connected then globalConn:Disconnect() end
+    end)
+end
+
+-- ============================================================
+-- 动画系统 v3.6
+-- 根本原因：CreateHumanoidModelFromDescription 生成的 NPC
+-- 没有 Animate 脚本，必须手动加载动画轨道
+-- 走路/待机/跳跃：手动控制（和老脚本一致）
+-- 睡觉/坐下：特殊状态手动接管
+-- ============================================================
+local function setupAnimations(model, conns)
+    local hum  = safeWait(model, "Humanoid", 5)
+    local root = safeWait(model, "HumanoidRootPart", 5)
+    if not hum or not root then
+        warn("[NPC][动画] 找不到 Humanoid 或 HumanoidRootPart，动画初始化失败")
+        return
+    end
+
+    local animator = hum:FindFirstChildOfClass("Animator")
+        or Instance.new("Animator", hum)
+
+    local function loadAnim(id)
+        local a = Instance.new("Animation")
+        a.AnimationId = "rbxassetid://" .. id
+        local ok, track = pcall(function() return animator:LoadAnimation(a) end)
+        a:Destroy()
+        if ok and track then
+            print("[NPC][动画] 加载成功: " .. id)
+            return track
+        end
+        warn("[NPC][动画] 加载失败: " .. id)
+        return nil
+    end
+
+    -- 老脚本原始动画 ID
+    local idleTrack  = loadAnim("180435571")   -- 待机
+    local walkTrack  = loadAnim("180426354")   -- 走路
+    local jumpTrack  = loadAnim("125750702")   -- 跳跃
+    local sleepTrack = loadAnim("2506281703")  -- 睡觉
+
+    if idleTrack  then idleTrack.Looped  = true  end
+    if walkTrack  then walkTrack.Looped  = true  end
+    if sleepTrack then sleepTrack.Looped = true  end
+
+    -- 坐下动画（老版本可用 ID，Action 优先级）
+    local sitTrack = loadAnim("178130996")
+    if sitTrack then
+        sitTrack.Looped = true
+        sitTrack.Priority = Enum.AnimationPriority.Action
+    end
+
+    local currentTrack = nil
+
+    -- 和老脚本完全一致的切换函数
+    local function playTrack(newTrack)
+        if not newTrack then return end
+        if currentTrack == newTrack then return end
+        if currentTrack then currentTrack:Stop(0.2) end
+        currentTrack = newTrack
+        currentTrack:Play(0.2)
+    end
+
+    local animLoop = RunService.Heartbeat:Connect(function()
+        if not model.Parent or not hum or not root then return end
+
+        -- 坐下：播坐下动画 + 降低 HipHeight
+        if isSitting then
+            if sitTrack and not sitTrack.IsPlaying then
+                if currentTrack and currentTrack.IsPlaying then
+                    currentTrack:Stop(0.2)
+                    currentTrack = nil
+                end
+                sitTrack:Play(0.3)
+                hum.HipHeight = -1.5
+            end
+            return
+        else
+            if sitTrack and sitTrack.IsPlaying then
+                sitTrack:Stop(0.2)
+                hum.HipHeight = 0
+            end
+        end
+
+        -- 躺下：HipHeight 极低 + 播待机（物理锁在指令处处理）
+        if isSleeping then
+            if currentTrack and currentTrack.IsPlaying then
+                currentTrack:Stop(0.15)
+                currentTrack = nil
+            end
+            hum.HipHeight = -2.5
+            return
+        end
+
+        local vel   = root.AssemblyLinearVelocity
+        local speed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+
+        if hum.FloorMaterial == Enum.Material.Air then
+            hum.HipHeight = 0
+            playTrack(jumpTrack)
+        elseif speed > 0.1 then
+            hum.HipHeight = 0
+            playTrack(walkTrack)
+            if walkTrack then walkTrack:AdjustSpeed(speed / 16) end
+        else
+            hum.HipHeight = 0
+            playTrack(idleTrack)
+        end
+    end)
+
+    table.insert(conns, animLoop)
+    print("[NPC][动画] 动画系统启动完成")
+end
+
+-- ============================================================
+-- NPC 核心创建函数
+-- ============================================================
+local function createNPC()
+    if npc then npc:Destroy(); npc = nil end
+    clearConnections()
+
+    isFollowing     = false
+    isSleeping      = false
+    isSitting       = false
+    isMimicking     = false
+    targetPos       = nil
+    stuckTime       = 0
+    jumpCount       = 0
+    runStartTime    = 0
+    hasComplained   = false
+    playerStillTime = 0
+    hasPokedIdle    = false
+    lastCheckPeopleTime = os.clock()
+
+    local char   = player.Character or player.CharacterAdded:Wait()
+    local myRoot = safeWait(char, "HumanoidRootPart", 5)
+    local myHum  = safeWait(char, "Humanoid", 5)
+    if not myRoot or not myHum then return end
+
+    local success, desc = getDesc()
+    if not success then return end
+
+    npc = Players:CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R6)
+    npc.Name   = NPC_DISPLAY_NAME
+    npc.Parent = workspace
+    npc:MakeJoints()
+
+    local hum  = safeWait(npc, "Humanoid", 5)
+    local root = npc.PrimaryPart or safeWait(npc, "HumanoidRootPart", 5)
+    if not hum or not root then npc:Destroy(); npc = nil; return end
+
+    hum.DisplayName = NPC_DISPLAY_NAME
+    hum.WalkSpeed   = math.max(myHum.WalkSpeed - 1, 1)
+    hum.AutoRotate  = true
+
+    root.CFrame = myRoot.CFrame * CFrame.new(3, 0, -3)
+    task.defer(function() npcSay("你好呀 OvO") end)
+
+    task.delay(3, function()
+        if enabled and npc and npc.Parent then
+            npcSay("检查了一下，现在服务器有 " .. #Players:GetPlayers() .. " 个人哦~")
+        end
+    end)
+
+    task.wait(0.5)  -- 等 Animate 脚本加载完再接管
+    setupAnimations(npc, connections)
+
+    -- 玩家进出通知
+    table.insert(connections, Players.PlayerAdded:Connect(function(p)
+        npcSay(p.Name .. "加入了服务器~")
+    end))
+    table.insert(connections, Players.PlayerRemoving:Connect(function(p)
+        npcSay(p.Name .. "偷偷跑走了 QAQ")
+    end))
+
+    -- 角色重生
+    table.insert(connections, player.CharacterAdded:Connect(function(newChar)
+        char   = newChar
+        myRoot = safeWait(newChar, "HumanoidRootPart", 5)
+        myHum  = safeWait(newChar, "Humanoid", 5)
+    end))
+
+    -- 模仿模式
+    local mimicTrack = nil
+    local myAnimator = myHum:FindFirstChildOfClass("Animator")
+    if myAnimator then
+        table.insert(connections, myAnimator.AnimationPlayed:Connect(function(track)
+            if not isMimicking then return end
+            if not npc or not hum then return end
+            local npcAnimator = hum:FindFirstChildOfClass("Animator")
+            if not npcAnimator then return end
+            if mimicTrack and mimicTrack.IsPlaying then mimicTrack:Stop() end
+            local newAnim = Instance.new("Animation")
+            newAnim.AnimationId = track.Animation.AnimationId
+            mimicTrack = npcAnimator:LoadAnimation(newAnim)
+            mimicTrack:Play(track.FadeTime, track.Weight, track.Speed)
+            newAnim:Destroy()
+            track.Ended:Connect(function()
+                if mimicTrack and mimicTrack.IsPlaying then mimicTrack:Stop() end
+            end)
+            track.Stopped:Connect(function()
+                if mimicTrack and mimicTrack.IsPlaying then mimicTrack:Stop() end
+            end)
+        end))
+    end
+
+    -- ============================================================
+    -- 聊天指令
+    -- ============================================================
+    table.insert(connections, player.Chatted:Connect(function(msg)
+        local lowerMsg = msg:lower()
+
+        if lowerMsg == "睡觉" or lowerMsg == "躺下" then
+            isSleeping = true; isSitting = false; isMimicking = false; isFollowing = false
+            hum.Sit = false
+            hum.AutoRotate = false
+            hum.WalkSpeed = 0
+            hum.JumpPower = 0
+            -- 先让 NPC 停下，然后旋转躺平并锁定
+            task.spawn(function()
+                task.wait(0.1)
+                if not isSleeping then return end
+                -- 旋转90度躺平
+                local yAngle = math.atan2(root.CFrame.LookVector.X, root.CFrame.LookVector.Z)
+                root.CFrame = CFrame.new(root.Position.X, root.Position.Y - 2.5, root.Position.Z)
+                    * CFrame.Angles(0, yAngle, 0)
+                    * CFrame.Angles(math.rad(90), 0, 0)
+                -- 锁定所有部件防止抽搐
+                for _, p in pairs(npc:GetDescendants()) do
+                    if p:IsA("BasePart") then p.Anchored = true end
+                end
+            end)
+            npcSay("晚安~我先睡啦 zZZ")
+
+        elseif lowerMsg == "起来" then
+            local wasSleeping = isSleeping
+            local wasSitting  = isSitting
+            isSleeping = false; isSitting = false
+            hum.Sit = false
+            hum.AutoRotate = true
+            hum.HipHeight = 0
+            hum.JumpPower = 50
+            -- 恢复物理和速度
+            -- 解锁所有部件
+            for _, p in pairs(npc:GetDescendants()) do
+                if p:IsA("BasePart") then p.Anchored = false end
+            end
+            hum.HipHeight = 0
+            local myHumRef = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+            hum.WalkSpeed = myHumRef and math.max(myHumRef.WalkSpeed - 1, 1) or 16
+            hum.JumpPower = 50
+            if wasSleeping then npcSay("好哒，我起来啦，睡得好香~")
+            elseif wasSitting then npcSay("好哒，我站起来啦")
+            else npcSay("我本来就站着呢~") end
+
+        elseif lowerMsg == "坐下" then
+            isSitting = true; isSleeping = false; isMimicking = false; isFollowing = false
+            hum.Sit = false
+            hum.WalkSpeed = 0
+            hum.JumpPower = 0
+            npcSay("好的，我坐下啦~")
+
+        elseif lowerMsg == "学我" then
+            isMimicking = true; isSleeping = false; isFollowing = false
+            npcSay("好哒，我会跟着你做一样的动作哦~")
+
+        elseif lowerMsg == "别学了" then
+            isMimicking = false
+            npcSay("好滴，不学啦")
+
+        elseif lowerMsg == "跟我走" or lowerMsg == "跟着我" then
+            isMimicking = false; isSleeping = false; isFollowing = true
+            hum.HipHeight = 0
+            npcSay("好哒，我跟着你走")
+
+        elseif lowerMsg == "别跟着我" or lowerMsg == "停下" then
+            isFollowing = false
+            targetPos = root.Position
+            npcSay("好滴，我停下啦")
+
+        elseif lowerMsg == "过来" then
+            if myRoot then
+                root.CFrame = myRoot.CFrame * CFrame.new(0, 0, -4)
+                targetPos = root.Position
+                npcSay("我来啦~")
+            end
+
+        elseif lowerMsg == "跳一下" then
+            hum.Jump = true
+
+        elseif lowerMsg:find("多少人") or lowerMsg:find("几个人") or lowerMsg == "报数" then
+            npcSay("现在服务器一共有 " .. #Players:GetPlayers() .. " 个人哦~")
+            lastCheckPeopleTime = os.clock()
+
+        elseif lowerMsg:sub(1, 2) == "说话" then
+            local content = msg:sub(4)
+            if content and content ~= "" then
+                if #content > 100 then
+                    npcSay("（内容太长已截断）" .. content:sub(1, 100))
+                else
+                    npcSay(content)
+                end
+            end
+        end
+    end))
+
+    -- 定时报数
+    task.delay(AUTO_REPORT_INTERVAL, function()
+        while enabled and npc and npc.Parent do
+            npcSay("检查了一下，现在服务器还是 " .. #Players:GetPlayers() .. " 个人呢~")
+            lastCheckPeopleTime = os.clock()
+            task.wait(AUTO_REPORT_INTERVAL)
+        end
+    end)
+
+    -- 随机闲话
+    local IDLE_LINES = {
+        "你好呀 7w7", "我好无聊 OvO", "我想吃火锅 QAQ",
+        "在干嘛呢 :3", "月不月呀 7w7", "我会一直跟着你 OvO",
+    }
+    task.delay(45, function()
+        while enabled and npc and npc.Parent do
+            npcSay(IDLE_LINES[math.random(1, #IDLE_LINES)])
+            task.wait(45)
+        end
+    end)
+
+    -- ============================================================
+    -- 主逻辑循环（跟随改回老脚本直接 MoveTo，去掉寻路）
+    -- ============================================================
+    local logicLoop = RunService.Heartbeat:Connect(function(dt)
+        if not enabled then return end
+
+        if not npc or not npc.Parent or not hum or not root then
+            if not isRecreating then
+                isRecreating = true
+                task.spawn(function()
+                    task.wait(0.5); pcall(createNPC); isRecreating = false
+                end)
+            end
+            return
+        end
+        if not myRoot or not myHum then return end
+
+        local currentPos = root.Position
+        local playerPos  = myRoot.Position
+        local dist       = (currentPos - playerPos).Magnitude
+
+        -- 超远瞬移
+        if dist > MAX_FOLLOW_DISTANCE then
+            root.CFrame = myRoot.CFrame * CFrame.new(3, 0, 3)
+            npcSay("等等我，我瞬移过来啦:D")
+            isFollowing = false; return
+        end
+
+        -- 模仿模式
+        if isMimicking then
+            hum:MoveTo(playerPos + (myRoot.CFrame.LookVector * -3))
+            if myHum.FloorMaterial == Enum.Material.Air
+                and hum.FloorMaterial ~= Enum.Material.Air then
+                hum.Jump = true
+            end
+            hum.WalkSpeed = myHum.WalkSpeed
+            return
+        end
+
+        -- 速度：始终比玩家慢1点
+        hum.WalkSpeed = math.max(myHum.WalkSpeed - 1, 1)
+
+        -- 玩家静止超7秒搭话
+        local pSpeed = Vector3.new(
+            myRoot.AssemblyLinearVelocity.X, 0,
+            myRoot.AssemblyLinearVelocity.Z).Magnitude
+        if pSpeed < 0.5 then
+            playerStillTime = playerStillTime + dt
+            if playerStillTime >= 7 and not hasPokedIdle then
+                hasPokedIdle = true
+                local POKE = {"你在干什么呀 :3","人呢人呢～","干啥呢 OvO","挂机了吗 DAD"}
+                npcSay(POKE[math.random(1, #POKE)])
+            end
+        else
+            playerStillTime = 0; hasPokedIdle = false
+        end
+
+        -- 跟随：直接 MoveTo 玩家位置（老脚本方式，流畅）
+        if isFollowing then
+            hum:MoveTo(playerPos)
+
+            -- 防卡死
+            if root.AssemblyLinearVelocity.Magnitude < 1 and dist > 8 then
+                stuckTime = stuckTime + dt
+                if stuckTime > 1.5 then
+                    hum.Jump = true; stuckTime = 0; jumpCount = jumpCount + 1
+                    if jumpCount >= 3 then
+                        task.spawn(function()
+                            for _, p in pairs(npc:GetChildren()) do
+                                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                                    p.CanCollide = false
+                                end
+                            end
+                            task.wait(1.5)
+                            if not npc or not npc.Parent then return end
+                            for _, p in pairs(npc:GetChildren()) do
+                                if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+                                    p.CanCollide = true
+                                end
+                            end
+                            jumpCount = 0
+                        end)
+                    end
+                end
+            else
+                stuckTime = 0; jumpCount = 0
+            end
+
+            -- 追了超过5秒喊累
+            if runStartTime > 0 and not hasComplained
+                and os.clock() - runStartTime > 5 then
+                local COMPLAIN = {"等等我 QAQ","好累呀 TAT","让我休息一下吧 T^T","不要再走了 DAD"}
+                npcSay(COMPLAIN[math.random(1, #COMPLAIN)])
+                hasComplained = true
+            end
+
+        else
+            -- 原地待命：15秒小幅闲逛
+            if os.clock() - lastMoveTime > 15 then
+                targetPos    = playerPos + Vector3.new(math.random(-8, 8), 0, math.random(-8, 8))
+                lastMoveTime = os.clock()
+            end
+            if targetPos then hum:MoveTo(targetPos) end
+        end
+
+        -- 距离自动切换跟随
+        if not isSleeping and not isSitting then
+            if dist > FOLLOW_START_DISTANCE then
+                if not isFollowing then
+                    isFollowing   = true
+                    runStartTime  = os.clock()
+                    hasComplained = false
+                end
+            elseif dist < FOLLOW_STOP_DISTANCE then
+                if isFollowing then
+                    isFollowing   = false
+                    runStartTime  = 0
+                    hasComplained = false
+                    targetPos     = playerPos + Vector3.new(math.random(-8, 8), 0, math.random(-8, 8))
+                    lastMoveTime  = os.clock()
+                end
+            end
+        end
+    end)
+    table.insert(connections, logicLoop)
+end
+
+-- ============================================================
+-- GUI（可爱粉嫩风）
+-- ============================================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name           = "NPC_Executor_GUI"
+screenGui.Parent         = player:WaitForChild("PlayerGui")
+screenGui.ResetOnSpawn   = false
+screenGui.DisplayOrder   = 100
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local COLOR_OFF_BG     = Color3.fromRGB(255, 182, 193)
+local COLOR_ON_BG      = Color3.fromRGB(255, 105, 150)
+local COLOR_OFF_TEXT   = Color3.fromRGB(255, 255, 255)
+local COLOR_ON_TEXT    = Color3.fromRGB(255, 255, 255)
+local COLOR_OFF_STROKE = Color3.fromRGB(255, 150, 170)
+local COLOR_ON_STROKE  = Color3.fromRGB(220, 60, 110)
+local COLOR_SHADOW     = Color3.fromRGB(230, 130, 155)
+
+local shadowFrame = Instance.new("Frame")
+shadowFrame.Size                   = UDim2.new(0, 162, 0, 56)
+shadowFrame.Position               = UDim2.new(1, -168, 0.7, 4)
+shadowFrame.BackgroundColor3       = COLOR_SHADOW
+shadowFrame.BackgroundTransparency = 0.55
+shadowFrame.BorderSizePixel        = 0
+shadowFrame.ZIndex                 = 1
+shadowFrame.Parent                 = screenGui
+Instance.new("UICorner", shadowFrame).CornerRadius = UDim.new(0, 22)
+
+local mainBtn = Instance.new("TextButton")
+mainBtn.Name                   = "MainToggleBtn"
+mainBtn.Size                   = UDim2.new(0, 162, 0, 52)
+mainBtn.Position               = UDim2.new(1, -170, 0.7, 0)
+mainBtn.BackgroundColor3       = COLOR_OFF_BG
+mainBtn.BackgroundTransparency = 0
+mainBtn.Text                   = "🌸 伙伴：关"
+mainBtn.TextColor3             = COLOR_OFF_TEXT
+mainBtn.Font                   = Enum.Font.GothamBold
+mainBtn.TextSize               = 17
+mainBtn.AutoButtonColor        = false
+mainBtn.Active                 = true
+mainBtn.ZIndex                 = 2
+mainBtn.Parent                 = screenGui
+Instance.new("UICorner", mainBtn).CornerRadius = UDim.new(0, 22)
+
+local btnStroke = Instance.new("UIStroke", mainBtn)
+btnStroke.Color        = COLOR_OFF_STROKE
+btnStroke.Thickness    = 2.5
+btnStroke.Transparency = 0.1
+
+local highlight = Instance.new("Frame", mainBtn)
+highlight.Size                   = UDim2.new(0.6, 0, 0, 3)
+highlight.Position               = UDim2.new(0.2, 0, 0, 5)
+highlight.BackgroundColor3       = Color3.fromRGB(255, 255, 255)
+highlight.BackgroundTransparency = 0.55
+highlight.BorderSizePixel        = 0
+highlight.ZIndex                 = 3
+Instance.new("UICorner", highlight).CornerRadius = UDim.new(1, 0)
+
+local function tweenBtnScale(sx, sy)
+    TweenService:Create(mainBtn, TweenInfo.new(0.1, Enum.EasingStyle.Back), {
+        Size = UDim2.new(0, 162 * sx, 0, 52 * sy)
+    }):Play()
+end
+
+mainBtn.MouseButton1Down:Connect(function() tweenBtnScale(0.94, 0.92) end)
+mainBtn.MouseButton1Up:Connect(function() tweenBtnScale(1, 1) end)
+makeDraggable(mainBtn)
+
+local function syncShadow()
+    shadowFrame.Position = UDim2.new(
+        mainBtn.Position.X.Scale, mainBtn.Position.X.Offset + 6,
+        mainBtn.Position.Y.Scale, mainBtn.Position.Y.Offset + 5
+    )
+end
+
+mainBtn.MouseButton1Click:Connect(function()
+    enabled = not enabled
+    if enabled then
+        mainBtn.Text = "💕 伙伴：开"
+        TweenService:Create(mainBtn, TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+            BackgroundColor3 = COLOR_ON_BG, TextColor3 = COLOR_ON_TEXT
+        }):Play()
+        TweenService:Create(btnStroke, TweenInfo.new(0.25), {Color = COLOR_ON_STROKE}):Play()
+        TweenService:Create(shadowFrame, TweenInfo.new(0.25), {
+            BackgroundColor3 = Color3.fromRGB(200, 60, 100)
+        }):Play()
+        TweenService:Create(mainBtn, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 172, 0, 56)
+        }):Play()
+        task.delay(0.15, function()
+            TweenService:Create(mainBtn, TweenInfo.new(0.2, Enum.EasingStyle.Bounce), {
+                Size = UDim2.new(0, 162, 0, 52)
+            }):Play()
+        end)
+        createNPC()
+    else
+        mainBtn.Text = "🌸 伙伴：关"
+        TweenService:Create(mainBtn, TweenInfo.new(0.25, Enum.EasingStyle.Quad), {
+            BackgroundColor3 = COLOR_OFF_BG, TextColor3 = COLOR_OFF_TEXT
+        }):Play()
+        TweenService:Create(btnStroke, TweenInfo.new(0.25), {Color = COLOR_OFF_STROKE}):Play()
+        TweenService:Create(shadowFrame, TweenInfo.new(0.25), {
+            BackgroundColor3 = COLOR_SHADOW
+        }):Play()
+        if npc then npc:Destroy(); npc = nil end
+        clearConnections()
+    end
+    syncShadow()
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+    if p ~= player then return end
+    pcall(function()
+        enabled = false
+        if npc then npc:Destroy() end
+        clearConnections()
+        if screenGui and screenGui.Parent then screenGui:Destroy() end
+    end)
+end)
