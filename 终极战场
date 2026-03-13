@@ -1,0 +1,463 @@
+-- 碰撞箱扩大脚本 v2
+-- 优化：默认值改25、新增收起/展开按钮、输入框优化
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local LP = Players.LocalPlayer
+local PlayerGui = LP:WaitForChild("PlayerGui")
+
+-- ====================== 核心逻辑 ======================
+local S = {
+    Players = Players,
+    RunService = RunService,
+    ReplicatedStorage = ReplicatedStorage,
+    Cfg = { Hitbox = false, X = 25, Y = 25, Z = 25, Enhancer = false, Multi = 3 },
+    Cache = {},
+    Conn = nil,
+    DashT = 0
+}
+
+getgenv().HitboxEnabled = false
+
+function S:HRP()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+function S:GetCore()
+    if self.Cache.Core then return self.Cache.Core end
+    local ok, core = pcall(function()
+        return require(self.ReplicatedStorage:WaitForChild("Core", 10))
+    end)
+    if ok then self.Cache.Core = core; return core end
+end
+
+function S:ToggleHitbox(state)
+    self.Cfg.Hitbox = state
+    getgenv().HitboxEnabled = state
+    local core = self:GetCore()
+    if not core or not core.Get then return end
+    local hit = core.Get("Combat", "Hit")
+    if not hit or not hit.Box then return end
+    if state then
+        if not self.Cache.OrigBox then self.Cache.OrigBox = hit.Box end
+        hit.Box = function(_, char, data)
+            data = data or {}
+            data.Size = Vector3.new(self.Cfg.X, self.Cfg.Y, self.Cfg.Z)
+            return self.Cache.OrigBox(nil, char, data)
+        end
+    else
+        if self.Cache.OrigBox then hit.Box = self.Cache.OrigBox end
+    end
+end
+
+function S:Dash()
+    if tick() - self.DashT < 0.18 then return end
+    self.DashT = tick()
+    local hrp = self:HRP()
+    if not hrp then return end
+    pcall(function()
+        self:GetCore().Library("Remote").Send("Dash", hrp.CFrame, "L", 1)
+    end)
+end
+
+function S:EnableEnhancer()
+    if self.Cache.HitProc then return end
+    local ok, hit = pcall(function()
+        return require(LP.PlayerScripts:WaitForChild("Combat"):WaitForChild("Hit"))
+    end)
+    if not ok or not hit.Process then return end
+    self.Cache.HitProc = hit.Process
+    hit.Process = function(...)
+        local best, targets, blocked = self.Cache.HitProc(...)
+        if not targets or #targets == 0 then return best, targets, blocked end
+        self:Dash()
+        local r = self.ReplicatedStorage.Remotes.Combat.Action
+        for _ = 1, self.Cfg.Multi do
+            pcall(function()
+                r:FireServer(nil, "", 4, 69, {BestHitCharacter=nil, HitCharacters=targets, Ignore={}, Actions={}})
+            end)
+        end
+        return best, targets, blocked
+    end
+end
+
+function S:DisableEnhancer()
+    if not self.Cache.HitProc then return end
+    local ok, hit = pcall(function() return require(LP.PlayerScripts.Combat.Hit) end)
+    if ok then hit.Process = self.Cache.HitProc end
+    self.Cache.HitProc = nil
+end
+
+function S:StartDashLoop()
+    if self.Conn then return end
+    self.Conn = RunService.Heartbeat:Connect(function() self:Dash() end)
+end
+
+function S:StopDashLoop()
+    if self.Conn then self.Conn:Disconnect(); self.Conn = nil end
+end
+
+-- ====================== GUI ======================
+local oldGui = PlayerGui:FindFirstChild("HitboxGui")
+if oldGui then oldGui:Destroy() end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name           = "HitboxGui"
+screenGui.ResetOnSpawn   = false
+screenGui.DisplayOrder   = 100
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent         = PlayerGui
+
+local PANEL_H_OPEN    = 224
+local PANEL_H_CLOSED  = 40
+local isCollapsed     = false
+local isMini          = false  -- 缩成小方块状态
+
+-- 主面板
+local panel = Instance.new("Frame")
+panel.Name                   = "Panel"
+panel.Size                   = UDim2.new(0, 240, 0, PANEL_H_OPEN)
+panel.Position               = UDim2.new(0, 16, 0.5, -112)
+panel.BackgroundColor3       = Color3.fromRGB(18, 18, 24)
+panel.BackgroundTransparency = 0.05
+panel.BorderSizePixel        = 0
+panel.ClipsDescendants       = true   -- 收起时裁剪子元素
+panel.Parent                 = screenGui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 16)
+local panelStroke = Instance.new("UIStroke", panel)
+panelStroke.Color = Color3.fromRGB(90, 90, 130); panelStroke.Thickness = 1.5; panelStroke.Transparency = 0.3
+
+-- 标题栏（拖拽区 + 收起按钮在同一行）
+local titleBar = Instance.new("Frame")
+titleBar.Size                   = UDim2.new(1, 0, 0, 40)
+titleBar.BackgroundTransparency = 1
+titleBar.Parent                 = panel
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size                = UDim2.new(1, -48, 1, 0)
+titleLabel.Position            = UDim2.new(0, 12, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text                = "🌐 是鸭不是鸦"
+titleLabel.TextColor3          = Color3.fromRGB(200, 200, 255)
+titleLabel.Font                = Enum.Font.GothamBold
+titleLabel.TextSize            = 15
+titleLabel.TextXAlignment      = Enum.TextXAlignment.Left
+titleLabel.Parent              = titleBar
+
+-- 收起/展开按钮（左移给 mini 按钮腾位）
+local collapseBtn = Instance.new("TextButton")
+collapseBtn.Size             = UDim2.new(0, 28, 0, 28)
+collapseBtn.Position         = UDim2.new(1, -72, 0, 6)
+collapseBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+collapseBtn.Text             = "▲"
+collapseBtn.TextColor3       = Color3.fromRGB(180, 180, 255)
+collapseBtn.Font             = Enum.Font.GothamBold
+collapseBtn.TextSize         = 11
+collapseBtn.BorderSizePixel  = 0
+collapseBtn.AutoButtonColor  = false
+collapseBtn.Parent           = titleBar
+Instance.new("UICorner", collapseBtn).CornerRadius = UDim.new(0, 8)
+
+collapseBtn.MouseButton1Click:Connect(function()
+    if isMini then return end  -- mini 状态下不响应
+    isCollapsed = not isCollapsed
+    if isCollapsed then
+        collapseBtn.Text = "▼"
+        TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 240, 0, PANEL_H_CLOSED)
+        }):Play()
+    else
+        collapseBtn.Text = "▲"
+        TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 240, 0, PANEL_H_OPEN)
+        }):Play()
+    end
+end)
+
+-- 迷你按钮：缩成小方块
+local miniBtn = Instance.new("TextButton")
+miniBtn.Size             = UDim2.new(0, 28, 0, 28)
+miniBtn.Position         = UDim2.new(1, -38, 0, 6)
+miniBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+miniBtn.Text             = "鸦"
+miniBtn.TextColor3       = Color3.fromRGB(180, 180, 255)
+miniBtn.Font             = Enum.Font.GothamBold
+miniBtn.TextSize         = 12
+miniBtn.BorderSizePixel  = 0
+miniBtn.AutoButtonColor  = false
+miniBtn.Parent           = titleBar
+Instance.new("UICorner", miniBtn).CornerRadius = UDim.new(0, 8)
+
+-- 小方块（默认隐藏）
+local bubble = Instance.new("TextButton")
+bubble.Name                   = "MiniBubble"
+bubble.Size                   = UDim2.new(0, 44, 0, 44)
+bubble.Position               = UDim2.new(0, 16, 0.5, -22)  -- 和面板同位置
+bubble.BackgroundColor3       = Color3.fromRGB(18, 18, 24)
+bubble.BackgroundTransparency = 1  -- 初始隐藏
+bubble.Text                   = "鸦"
+bubble.TextColor3             = Color3.fromRGB(200, 200, 255)
+bubble.Font                   = Enum.Font.GothamBold
+bubble.TextSize                = 16
+bubble.BorderSizePixel         = 0
+bubble.AutoButtonColor         = false
+bubble.Visible                 = false
+bubble.ZIndex                  = 5
+bubble.Parent                  = screenGui
+Instance.new("UICorner", bubble).CornerRadius = UDim.new(0, 12)
+local bubbleStroke = Instance.new("UIStroke", bubble)
+bubbleStroke.Color = Color3.fromRGB(90, 90, 130); bubbleStroke.Thickness = 1.5; bubbleStroke.Transparency = 0.3
+
+-- mini 按钮点击：面板缩成小方块
+miniBtn.MouseButton1Click:Connect(function()
+    isMini = not isMini
+    if isMini then
+        -- 记录面板当前位置，供小方块定位
+        bubble.Position = UDim2.new(
+            panel.Position.X.Scale, panel.Position.X.Offset,
+            panel.Position.Y.Scale, panel.Position.Y.Offset
+        )
+        -- 面板淡出
+        TweenService:Create(panel, TweenInfo.new(0.18, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
+            Size = UDim2.new(0, 44, 0, 44),
+            BackgroundTransparency = 1,
+        }):Play()
+        TweenService:Create(panelStroke, TweenInfo.new(0.18), { Transparency = 1 }):Play()
+        task.delay(0.18, function()
+            panel.Visible = false
+            bubble.Visible = true
+            TweenService:Create(bubble, TweenInfo.new(0.15, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                BackgroundTransparency = 0.05
+            }):Play()
+        end)
+    else
+        -- 从小方块展开回面板
+        bubble.Visible = false
+        panel.Position = UDim2.new(
+            bubble.Position.X.Scale, bubble.Position.X.Offset,
+            bubble.Position.Y.Scale, bubble.Position.Y.Offset
+        )
+        panel.Visible = true
+        panel.BackgroundTransparency = 1
+        local targetH = isCollapsed and PANEL_H_CLOSED or PANEL_H_OPEN
+        TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+            Size = UDim2.new(0, 240, 0, targetH),
+            BackgroundTransparency = 0.05,
+        }):Play()
+        TweenService:Create(panelStroke, TweenInfo.new(0.2), { Transparency = 0.3 }):Play()
+    end
+end)
+
+-- 小方块点击展开
+bubble.MouseButton1Click:Connect(function()
+    isMini = false
+    bubble.Visible = false
+    panel.Position = UDim2.new(
+        bubble.Position.X.Scale, bubble.Position.X.Offset,
+        bubble.Position.Y.Scale, bubble.Position.Y.Offset
+    )
+    panel.Visible = true
+    panel.BackgroundTransparency = 1
+    local targetH = isCollapsed and PANEL_H_CLOSED or PANEL_H_OPEN
+    TweenService:Create(panel, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, 240, 0, targetH),
+        BackgroundTransparency = 0.05,
+    }):Play()
+    TweenService:Create(panelStroke, TweenInfo.new(0.2), { Transparency = 0.3 }):Play()
+end)
+
+-- 小方块也可以拖拽
+local bubbleDrag, bubbleDragStart, bubbleStartPos = false, nil, nil
+bubble.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        bubbleDrag = true; bubbleDragStart = input.Position; bubbleStartPos = bubble.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not bubbleDrag then return end
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        local d = input.Position - bubbleDragStart
+        bubble.Position = UDim2.new(bubbleStartPos.X.Scale, bubbleStartPos.X.Offset + d.X, bubbleStartPos.Y.Scale, bubbleStartPos.Y.Offset + d.Y)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        bubbleDrag = false
+    end
+end)
+
+-- 分隔线
+local divider = Instance.new("Frame")
+divider.Size = UDim2.new(1, -24, 0, 1)
+divider.Position = UDim2.new(0, 12, 0, 40)
+divider.BackgroundColor3 = Color3.fromRGB(90, 90, 130)
+divider.BackgroundTransparency = 0.5
+divider.BorderSizePixel = 0
+divider.Parent = panel
+
+-- 开关按钮
+local enabled = false
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size             = UDim2.new(1, -24, 0, 40)
+toggleBtn.Position         = UDim2.new(0, 12, 0, 50)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+toggleBtn.Text             = "🔴  已关闭"
+toggleBtn.TextColor3       = Color3.fromRGB(200, 100, 100)
+toggleBtn.Font             = Enum.Font.GothamBold
+toggleBtn.TextSize         = 14
+toggleBtn.BorderSizePixel  = 0
+toggleBtn.AutoButtonColor  = false
+toggleBtn.Parent           = panel
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 10)
+local toggleStroke = Instance.new("UIStroke", toggleBtn)
+toggleStroke.Color = Color3.fromRGB(200, 80, 80); toggleStroke.Thickness = 1.5; toggleStroke.Transparency = 0.3
+
+toggleBtn.MouseButton1Click:Connect(function()
+    enabled = not enabled
+    if enabled then
+        S:ToggleHitbox(true); S:EnableEnhancer(); S:StartDashLoop()
+        toggleBtn.Text             = "🟢  已开启"
+        toggleBtn.TextColor3       = Color3.fromRGB(100, 220, 100)
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(20, 50, 20)
+        toggleStroke.Color         = Color3.fromRGB(80, 200, 80)
+    else
+        S:ToggleHitbox(false); S:DisableEnhancer(); S:StopDashLoop()
+        toggleBtn.Text             = "🔴  已关闭"
+        toggleBtn.TextColor3       = Color3.fromRGB(200, 100, 100)
+        toggleBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 55)
+        toggleStroke.Color         = Color3.fromRGB(200, 80, 80)
+    end
+end)
+
+-- 轴输入框（带 +5 / -5 三角按钮）
+local function makeAxisInput(labelText, axis, posY)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -24, 0, 32)
+    row.Position = UDim2.new(0, 12, 0, posY)
+    row.BackgroundTransparency = 1
+    row.Parent = panel
+
+    -- 标签
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 52, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = labelText
+    label.TextColor3 = Color3.fromRGB(180, 180, 220)
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = row
+
+    -- 往下按钮 ▼（紧贴标签右边）
+    local downBtn = Instance.new("TextButton")
+    downBtn.Size             = UDim2.new(0, 26, 1, -4)
+    downBtn.Position         = UDim2.new(0, 54, 0, 2)
+    downBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 55)
+    downBtn.Text             = "▼"
+    downBtn.TextColor3       = Color3.fromRGB(160, 160, 220)
+    downBtn.Font             = Enum.Font.GothamBold
+    downBtn.TextSize         = 11
+    downBtn.BorderSizePixel  = 0
+    downBtn.AutoButtonColor  = false
+    downBtn.Parent           = row
+    Instance.new("UICorner", downBtn).CornerRadius = UDim.new(0, 6)
+
+    -- 输入框（中间）
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -140, 1, -4)
+    box.Position = UDim2.new(0, 84, 0, 2)
+    box.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+    box.Text = tostring(S.Cfg[axis])
+    box.TextColor3 = Color3.fromRGB(220, 220, 255)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 13
+    box.BorderSizePixel = 0
+    box.ClearTextOnFocus = false
+    box.Parent = row
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
+    local boxStroke = Instance.new("UIStroke", box)
+    boxStroke.Color = Color3.fromRGB(90, 90, 130); boxStroke.Thickness = 1.2; boxStroke.Transparency = 0.4
+
+    -- 往上按钮 ▲（输入框右边）
+    local upBtn = Instance.new("TextButton")
+    upBtn.Size             = UDim2.new(0, 26, 1, -4)
+    upBtn.Position         = UDim2.new(1, -28, 0, 2)
+    upBtn.BackgroundColor3 = Color3.fromRGB(35, 35, 55)
+    upBtn.Text             = "▲"
+    upBtn.TextColor3       = Color3.fromRGB(160, 160, 220)
+    upBtn.Font             = Enum.Font.GothamBold
+    upBtn.TextSize         = 11
+    upBtn.BorderSizePixel  = 0
+    upBtn.AutoButtonColor  = false
+    upBtn.Parent           = row
+    Instance.new("UICorner", upBtn).CornerRadius = UDim.new(0, 6)
+
+    -- 通用：更新数值并刷新显示
+    local function applyValue(v)
+        S.Cfg[axis] = math.clamp(v, 10, 150)
+        box.Text = tostring(S.Cfg[axis])
+        if enabled then S:ToggleHitbox(true) end
+    end
+
+    -- 输入框焦点高亮
+    box.Focused:Connect(function()
+        TweenService:Create(boxStroke, TweenInfo.new(0.1), { Transparency = 0 }):Play()
+    end)
+    box.FocusLost:Connect(function()
+        TweenService:Create(boxStroke, TweenInfo.new(0.1), { Transparency = 0.4 }):Play()
+        local v = tonumber(box.Text)
+        if v then applyValue(v) else box.Text = tostring(S.Cfg[axis]) end
+    end)
+
+    -- +5 / -5 按钮
+    upBtn.MouseButton1Click:Connect(function()
+        applyValue(S.Cfg[axis] + 5)
+        TweenService:Create(upBtn, TweenInfo.new(0.08), { BackgroundColor3 = Color3.fromRGB(60, 60, 100) }):Play()
+        task.delay(0.15, function()
+            TweenService:Create(upBtn, TweenInfo.new(0.08), { BackgroundColor3 = Color3.fromRGB(35, 35, 55) }):Play()
+        end)
+    end)
+    downBtn.MouseButton1Click:Connect(function()
+        applyValue(S.Cfg[axis] - 5)
+        TweenService:Create(downBtn, TweenInfo.new(0.08), { BackgroundColor3 = Color3.fromRGB(60, 60, 100) }):Play()
+        task.delay(0.15, function()
+            TweenService:Create(downBtn, TweenInfo.new(0.08), { BackgroundColor3 = Color3.fromRGB(35, 35, 55) }):Play()
+        end)
+    end)
+end
+
+makeAxisInput("X 轴", "X", 102)
+makeAxisInput("Y 轴", "Y", 142)
+makeAxisInput("Z 轴", "Z", 182)
+
+-- ====================== 面板拖拽（拖标题栏）======================
+local dragging, dragStart, startPos = false, nil, nil
+titleBar.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = input.Position; startPos = panel.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not dragging then return end
+    if input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch then
+        local d = input.Position - dragStart
+        panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
