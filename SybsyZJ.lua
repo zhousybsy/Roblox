@@ -9972,7 +9972,7 @@ local Window = Compkiller.new({
 
 -- Welcome Notification
 Notifier.new({
-	Title = "Teraphy Hub",
+	Title = "Sybsy",
 	Content = "欢迎！按 左Alt 打开/关闭菜单。",
 	Duration = 5,
 	Icon = "rbxassetid://73697711193405",
